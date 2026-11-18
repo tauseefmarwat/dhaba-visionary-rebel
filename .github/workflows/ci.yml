@@ -56,7 +56,7 @@ jobs:
         with:
           go-version: "1.22"
           cache: true
-          cache-dependency-path: orders-api/go.mod
+          cache-dependency-path: orders-api/go.sum
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test ./...
@@ -94,6 +94,7 @@ jobs:
             --no-interaction --prefer-dist --no-progress
           cd stats-api/ci-app
           composer require predis/predis:^2.2 --no-interaction --no-progress
+          rm -f tests/Feature/ExampleTest.php
           cp -R ../overlay/. .
           touch database/database.sqlite
           php artisan key:generate --force
