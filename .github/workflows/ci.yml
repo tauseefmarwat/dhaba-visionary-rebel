@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, ec2-staging]
 
 permissions:
   contents: read
@@ -137,7 +137,9 @@ jobs:
 
   build-and-push:
     name: Build, scan, and push changed images
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ec2-staging')
     needs:
       - web
       - menu-api
@@ -147,6 +149,8 @@ jobs:
       - dockerfiles-and-shell
       - kubernetes-manifests
     runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.changed.outputs.services }}
     permissions:
       contents: read
       id-token: write
@@ -280,3 +284,56 @@ jobs:
             echo "Critical ECR findings block this image set." >&2
             exit 1
           fi
+
+  deploy-staging:
+    name: Deploy changed images to EC2 Minikube staging
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/ec2-staging' &&
+      needs.build-and-push.result == 'success' &&
+      needs.build-and-push.outputs.services != '[]'
+    needs:
+      - build-and-push
+    runs-on: ubuntu-latest
+    environment: ec2-minikube-staging
+    env:
+      KUBECONFIG_B64: ${{ secrets.DEPLOYER_KUBECONFIG_B64 }}
+      SERVICES_JSON: ${{ needs.build-and-push.outputs.services }}
+      REGISTRY: ${{ vars.AWS_ACCOUNT || '940482421289' }}.dkr.ecr.${{ vars.AWS_REGION || 'eu-north-1' }}.amazonaws.com/dhaba-${{ vars.TEAM || 'visionary-rebel' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.0
+      - name: Configure kubectl credentials
+        run: |
+          if [[ -z "$KUBECONFIG_B64" ]]; then
+            echo "Missing GitHub Actions secret DEPLOYER_KUBECONFIG_B64." >&2
+            exit 1
+          fi
+
+          umask 077
+          kubeconfig_file="$RUNNER_TEMP/deployer.kubeconfig"
+          printf '%s' "$KUBECONFIG_B64" | base64 --decode > "$kubeconfig_file"
+          echo "KUBECONFIG=$kubeconfig_file" >> "$GITHUB_ENV"
+      - name: Deploy changed images to staging
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          while IFS= read -r service; do
+            image="$REGISTRY/$service:$GIT_SHA"
+            case "$service" in
+              postgres|redis) resource="statefulset/$service" ;;
+              web|menu-api|orders-api|kitchen-worker|stats-api) resource="deployment/$service" ;;
+              *)
+                echo "No Kubernetes workload is configured for service '$service'." >&2
+                exit 1
+                ;;
+            esac
+
+            kubectl get -n staging "$resource" >/dev/null
+            kubectl set image -n staging "$resource" "$service=$image"
+            kubectl rollout status -n staging "$resource" --timeout=5m
+          done < <(jq -r '.[]' <<< "$SERVICES_JSON")
+
+          kubectl get pods,ingress -n staging
